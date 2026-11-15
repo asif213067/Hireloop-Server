@@ -1,0 +1,190 @@
+import { Router } from "express";
+
+import { isObjectId, jobs, toObjectId } from "../db.js";
+import { requireAuth } from "../middleware/requireAuth.js";
+import { requireRole } from "../middleware/requireRole.js";
+import { perUserJobLimiter, perUserJobMutationLimiter } from "../middleware/rateLimiters.js";
+import { jobSchema } from "./jobs.validation.js";
+
+const jobsRouter = Router();
+
+// Chain for every /api/jobs route, after the app-level global limiter (index.js):
+// requireAuth -> requireRole("recruiter"); per route: limiter -> 415 -> validation -> handler
+
+jobsRouter.use(requireAuth, requireRole("recruiter"));
+
+// POST bodies must be application/json (also used by PUT)
+function requireJsonContentType(req, res, next) {
+  const contentType = req.headers["content-type"] || "";
+  if (!contentType.startsWith("application/json")) {
+    return res.status(415).json({ error: "Unsupported media type" });
+  }
+  next();
+}
+
+// 24-character hex or the job cannot exist
+function requireValidJobId(req, res, next) {
+  if (!isObjectId(req.params.id)) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  next();
+}
+
+// Zod validation; strict schema rejects unknown keys
+function validateJob(req, res, next) {
+  // Honeypot: any filled website field is a bot
+  const website = typeof req.body?.website === "string" ? req.body.website.trim() : undefined;
+  if (website) {
+    return res.status(400).json({ error: "Invalid request" });
+  }
+
+  const body = { ...req.body };
+  delete body.website;
+
+  const parsed = jobSchema.safeParse(body);
+  if (!parsed.success) {
+    const errors = {};
+    for (const issue of parsed.error.issues) {
+      const field = issue.path.join(".") || "_";
+      if (!(field in errors)) errors[field] = issue.message;
+    }
+    return res.status(400).json({ errors });
+  }
+
+  req.validatedJob = parsed.data;
+  next();
+}
+
+// One shape for every endpoint; "_id" never leaves the server
+function toJobResponse(doc) {
+  return {
+    id: doc._id.toString(),
+    title: doc.title,
+    companyName: doc.companyName,
+    category: doc.category,
+    jobType: doc.jobType,
+    isRemote: doc.isRemote,
+    location: doc.location ?? null,
+    deadline: doc.deadline.toISOString(),
+    salaryMin: doc.salaryMin ?? null,
+    salaryMax: doc.salaryMax ?? null,
+    salaryFrequency: doc.salaryFrequency ?? null,
+    responsibilities: doc.responsibilities,
+    requirements: doc.requirements,
+    status: doc.status,
+    createdAt: doc.createdAt.toISOString(),
+    updatedAt: doc.updatedAt.toISOString(),
+  };
+}
+
+// Own recruiter id, always from the DB-backed req.user
+function ownRecruiterId(req) {
+  return toObjectId(req.user.id);
+}
+
+// The recruiter's own jobs, newest first
+async function listMyJobs(req, res) {
+  const list = await jobs
+    .find({ recruiterId: ownRecruiterId(req) })
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .toArray();
+  res.json({ jobs: list.map(toJobResponse) });
+}
+
+async function getJob(req, res) {
+  // Ownership in the query: another recruiter's job is a 404 too
+  const job = await jobs.findOne({ _id: toObjectId(req.params.id), recruiterId: ownRecruiterId(req) });
+  if (!job) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  res.json({ job: toJobResponse(job) });
+}
+
+// Update only validated fields plus updatedAt
+async function updateJob(req, res) {
+  const job = req.validatedJob;
+
+  const update = {
+    title: job.title,
+    companyName: job.companyName,
+    category: job.category,
+    jobType: job.jobType,
+    isRemote: job.isRemote,
+    location: job.location ?? null,
+    deadline: job.deadline,
+    salaryMin: job.salaryMin ?? null,
+    salaryMax: job.salaryMax ?? null,
+    salaryFrequency: job.salaryFrequency ?? null,
+    responsibilities: job.responsibilities,
+    requirements: job.requirements,
+    updatedAt: new Date(),
+  };
+
+  const updated = await jobs.findOneAndUpdate(
+    { _id: toObjectId(req.params.id), recruiterId: ownRecruiterId(req) },
+    { $set: update },
+    { returnDocument: "after" }
+  );
+  if (!updated) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  res.json({ job: toJobResponse(updated) });
+}
+
+async function deleteJob(req, res) {
+  const result = await jobs.deleteOne({ _id: toObjectId(req.params.id), recruiterId: ownRecruiterId(req) });
+  if (result.deletedCount === 0) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  res.status(204).send();
+}
+
+// Insert only the validated fields; server sets identity, status and timestamps
+async function createJob(req, res) {
+  const job = req.validatedJob;
+  const now = new Date();
+
+  const document = {
+    title: job.title,
+    companyName: job.companyName,
+    category: job.category,
+    jobType: job.jobType,
+    isRemote: job.isRemote,
+    location: job.location ?? null,
+    deadline: job.deadline,
+    salaryMin: job.salaryMin ?? null,
+    salaryMax: job.salaryMax ?? null,
+    salaryFrequency: job.salaryFrequency ?? null,
+    responsibilities: job.responsibilities,
+    requirements: job.requirements,
+    recruiterId: ownRecruiterId(req),
+    status: "published",
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const result = await jobs.insertOne(document);
+
+  res.status(201).json({ job: toJobResponse({ ...document, _id: result.insertedId }) });
+}
+
+// "/mine" must be declared before "/:id"
+jobsRouter.get("/mine", listMyJobs);
+
+jobsRouter.get("/:id", requireValidJobId, getJob);
+
+jobsRouter.put(
+  "/:id",
+  perUserJobMutationLimiter,
+  requireValidJobId,
+  requireJsonContentType,
+  validateJob,
+  updateJob
+);
+
+jobsRouter.delete("/:id", perUserJobMutationLimiter, requireValidJobId, deleteJob);
+
+jobsRouter.post("/", perUserJobLimiter, requireJsonContentType, validateJob, createJob);
+
+export { jobsRouter };
