@@ -1,9 +1,12 @@
 import { Router } from "express";
 
-import { isObjectId, jobs, toObjectId } from "../db.js";
+import { applications, isObjectId, jobs, toObjectId } from "../db.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 import { requireRole } from "../middleware/requireRole.js";
-import { perUserJobLimiter, perUserJobMutationLimiter } from "../middleware/rateLimiters.js";
+import {
+  perUserJobLimiter,
+  perUserJobMutationLimiter,
+} from "../middleware/rateLimiters.js";
 import { jobSchema } from "./jobs.validation.js";
 
 const jobsRouter = Router();
@@ -33,7 +36,8 @@ function requireValidJobId(req, res, next) {
 // Zod validation; strict schema rejects unknown keys
 function validateJob(req, res, next) {
   // Honeypot: any filled website field is a bot
-  const website = typeof req.body?.website === "string" ? req.body.website.trim() : undefined;
+  const website =
+    typeof req.body?.website === "string" ? req.body.website.trim() : undefined;
   if (website) {
     return res.status(400).json({ error: "Invalid request" });
   }
@@ -56,7 +60,7 @@ function validateJob(req, res, next) {
 }
 
 // One shape for every endpoint; "_id" never leaves the server
-function toJobResponse(doc) {
+function toJobResponse(doc, applicantsCount = 0) {
   return {
     id: doc._id.toString(),
     title: doc.title,
@@ -72,6 +76,7 @@ function toJobResponse(doc) {
     responsibilities: doc.responsibilities,
     requirements: doc.requirements,
     status: doc.status,
+    applicantsCount,
     createdAt: doc.createdAt.toISOString(),
     updatedAt: doc.updatedAt.toISOString(),
   };
@@ -82,23 +87,47 @@ function ownRecruiterId(req) {
   return toObjectId(req.user.id);
 }
 
-// The recruiter's own jobs, newest first
+// The recruiter's own jobs, newest first, with one count query for all of them
 async function listMyJobs(req, res) {
   const list = await jobs
     .find({ recruiterId: ownRecruiterId(req) })
     .sort({ createdAt: -1 })
     .limit(100)
     .toArray();
-  res.json({ jobs: list.map(toJobResponse) });
+
+  // Applications per job in a single aggregation
+  const jobIds = list.map((job) => job._id);
+  const counts = await applications
+    .aggregate([
+      { $match: { jobId: { $in: jobIds } } },
+      { $group: { _id: "$jobId", count: { $sum: 1 } } },
+    ])
+    .toArray();
+
+  // Jobs without applications are not in the result, so they count as 0
+  const countByJobId = new Map(
+    counts.map((row) => [row._id.toString(), row.count]),
+  );
+
+  res.json({
+    jobs: list.map((job) =>
+      toJobResponse(job, countByJobId.get(job._id.toString()) ?? 0),
+    ),
+  });
 }
 
 async function getJob(req, res) {
   // Ownership in the query: another recruiter's job is a 404 too
-  const job = await jobs.findOne({ _id: toObjectId(req.params.id), recruiterId: ownRecruiterId(req) });
+  const job = await jobs.findOne({
+    _id: toObjectId(req.params.id),
+    recruiterId: ownRecruiterId(req),
+  });
   if (!job) {
     return res.status(404).json({ error: "Not found" });
   }
-  res.json({ job: toJobResponse(job) });
+
+  const applicantsCount = await applications.countDocuments({ jobId: job._id });
+  res.json({ job: toJobResponse(job, applicantsCount) });
 }
 
 // Update only validated fields plus updatedAt
@@ -124,19 +153,31 @@ async function updateJob(req, res) {
   const updated = await jobs.findOneAndUpdate(
     { _id: toObjectId(req.params.id), recruiterId: ownRecruiterId(req) },
     { $set: update },
-    { returnDocument: "after" }
+    { returnDocument: "after" },
   );
   if (!updated) {
     return res.status(404).json({ error: "Not found" });
   }
-  res.json({ job: toJobResponse(updated) });
+
+  const applicantsCount = await applications.countDocuments({
+    jobId: updated._id,
+  });
+  res.json({ job: toJobResponse(updated, applicantsCount) });
 }
 
 async function deleteJob(req, res) {
-  const result = await jobs.deleteOne({ _id: toObjectId(req.params.id), recruiterId: ownRecruiterId(req) });
+  const jobId = toObjectId(req.params.id);
+
+  // Ownership first: only then are the job's applications removed
+  const result = await jobs.deleteOne({
+    _id: jobId,
+    recruiterId: ownRecruiterId(req),
+  });
   if (result.deletedCount === 0) {
     return res.status(404).json({ error: "Not found" });
   }
+
+  await applications.deleteMany({ jobId });
   res.status(204).send();
 }
 
@@ -166,7 +207,10 @@ async function createJob(req, res) {
 
   const result = await jobs.insertOne(document);
 
-  res.status(201).json({ job: toJobResponse({ ...document, _id: result.insertedId }) });
+  // A new job has no applicants yet
+  res
+    .status(201)
+    .json({ job: toJobResponse({ ...document, _id: result.insertedId }, 0) });
 }
 
 // "/mine" must be declared before "/:id"
@@ -180,11 +224,22 @@ jobsRouter.put(
   requireValidJobId,
   requireJsonContentType,
   validateJob,
-  updateJob
+  updateJob,
 );
 
-jobsRouter.delete("/:id", perUserJobMutationLimiter, requireValidJobId, deleteJob);
+jobsRouter.delete(
+  "/:id",
+  perUserJobMutationLimiter,
+  requireValidJobId,
+  deleteJob,
+);
 
-jobsRouter.post("/", perUserJobLimiter, requireJsonContentType, validateJob, createJob);
+jobsRouter.post(
+  "/",
+  perUserJobLimiter,
+  requireJsonContentType,
+  validateJob,
+  createJob,
+);
 
 export { jobsRouter };
