@@ -26,13 +26,27 @@ export async function ensureJobIndexes() {
   await jobs.createIndexes([
     { key: { recruiterId: 1, createdAt: -1 } },
     { key: { status: 1, createdAt: -1 } },
+    // Public browsing: open jobs, newest first
+    { key: { status: 1, deadline: 1, createdAt: -1 } },
   ]);
 
-  // One application per seeker per job; the jobId prefix also speeds up counts
-  await applications.createIndex(
-    { jobId: 1, applicantId: 1 },
-    { unique: true },
+  // Keyword search; a collection can have only one text index
+  await jobs.createIndex(
+    {
+      title: "text",
+      companyName: "text",
+      category: "text",
+      responsibilities: "text",
+      requirements: "text",
+    },
+    {
+      name: "jobs_text_search",
+      weights: { title: 10, companyName: 5, category: 3, responsibilities: 1, requirements: 1 },
+    }
   );
+
+  // One application per seeker per job; the jobId prefix also speeds up counts
+  await applications.createIndex({ jobId: 1, applicantId: 1 }, { unique: true });
 }
 
 // The Mongo adapter stores Better Auth ids as ObjectIds; sub is the hex string

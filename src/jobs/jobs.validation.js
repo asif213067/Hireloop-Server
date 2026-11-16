@@ -5,6 +5,7 @@ export const ALLOWED_CATEGORIES = [
   "Engineering & Tech",
   "Design",
   "Product",
+  "Product Management",
   "Marketing",
   "Sales",
   "Data & Analytics",

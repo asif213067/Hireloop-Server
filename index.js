@@ -9,6 +9,7 @@ import { requireAuth } from "./src/middleware/requireAuth.js";
 import { requireRole } from "./src/middleware/requireRole.js";
 import { globalLimiter } from "./src/middleware/rateLimiters.js";
 import { jobsRouter } from "./src/jobs/jobs.routes.js";
+import { publicJobsRouter } from "./src/public/publicJobs.routes.js";
 
 const app = express();
 const port = env.port;
@@ -54,6 +55,9 @@ app.get("/users", requireAuth, requireRole("admin"), async (req, res) => {
   const result = await cursor.toArray();
   res.send(result);
 });
+
+// Public job browsing: no login, IP rate limit, safe fields only
+app.use("/api/public/jobs", publicJobsRouter);
 
 // /api/jobs order: global limiter -> requireAuth -> requireRole("recruiter")
 // -> per-route limiter -> 415 check -> zod validation -> handler (see jobs.routes.js)
