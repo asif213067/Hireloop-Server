@@ -10,6 +10,9 @@ import { requireRole } from "./src/middleware/requireRole.js";
 import { globalLimiter } from "./src/middleware/rateLimiters.js";
 import { jobsRouter } from "./src/jobs/jobs.routes.js";
 import { publicJobsRouter } from "./src/public/publicJobs.routes.js";
+import { applicationsRouter } from "./src/applications/applications.routes.js";
+import { accountRouter } from "./src/account/account.routes.js";
+import { savedJobsRouter } from "./src/saved-jobs/saved-jobs.routes.js";
 
 const app = express();
 const port = env.port;
@@ -62,6 +65,15 @@ app.use("/api/public/jobs", publicJobsRouter);
 // /api/jobs order: global limiter -> requireAuth -> requireRole("recruiter")
 // -> per-route limiter -> 415 check -> zod validation -> handler (see jobs.routes.js)
 app.use("/api/jobs", jobsRouter);
+
+// Seeker applications: signed-in seekers only
+app.use("/api/applications", applicationsRouter);
+
+// Account type changes: any signed-in user switches seeker/recruiter
+app.use("/api/account", accountRouter);
+
+// Saved jobs: signed-in seekers only
+app.use("/api/saved-jobs", savedJobsRouter);
 
 // JSON 404 for unknown routes
 app.use((req, res) => {

@@ -42,6 +42,8 @@ export async function requireAuth(req, res, next) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  req.user = { id: user._id.toString(), role: user.role, name: user.name, email: user.email };
+  // Only exact known roles keep their power; anything else is a seeker
+  const role = ["seeker", "recruiter", "admin"].includes(user.role) ? user.role : "seeker";
+  req.user = { id: user._id.toString(), role, name: user.name, email: user.email };
   next();
 }

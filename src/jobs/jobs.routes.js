@@ -1,6 +1,6 @@
 import { Router } from "express";
 
-import { applications, isObjectId, jobs, toObjectId } from "../db.js";
+import { applications, isObjectId, jobs, savedJobs, toObjectId } from "../db.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 import { requireRole } from "../middleware/requireRole.js";
 import {
@@ -166,18 +166,17 @@ async function updateJob(req, res) {
 }
 
 async function deleteJob(req, res) {
-  const jobId = toObjectId(req.params.id);
-
-  // Ownership first: only then are the job's applications removed
+  // Ownership in the query; applications are kept so seekers keep their history
   const result = await jobs.deleteOne({
-    _id: jobId,
+    _id: toObjectId(req.params.id),
     recruiterId: ownRecruiterId(req),
   });
   if (result.deletedCount === 0) {
     return res.status(404).json({ error: "Not found" });
   }
 
-  await applications.deleteMany({ jobId });
+  // Saved rows for the deleted job are removed too
+  await savedJobs.deleteMany({ jobId: toObjectId(req.params.id) });
   res.status(204).send();
 }
 

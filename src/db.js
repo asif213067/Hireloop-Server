@@ -16,6 +16,9 @@ export const jobs = db.collection("jobs");
 // One document per application: { jobId, applicantId, createdAt }
 export const applications = db.collection("applications");
 
+// One document per saved job: { jobId, applicantId, createdAt }
+export const savedJobs = db.collection("savedJobs");
+
 export async function connectToMongoDB() {
   await mongoClient.connect();
   console.log("You successfully connected to MongoDB!");
@@ -41,12 +44,27 @@ export async function ensureJobIndexes() {
     },
     {
       name: "jobs_text_search",
-      weights: { title: 10, companyName: 5, category: 3, responsibilities: 1, requirements: 1 },
-    }
+      weights: {
+        title: 10,
+        companyName: 5,
+        category: 3,
+        responsibilities: 1,
+        requirements: 1,
+      },
+    },
   );
 
   // One application per seeker per job; the jobId prefix also speeds up counts
-  await applications.createIndex({ jobId: 1, applicantId: 1 }, { unique: true });
+  await applications.createIndex(
+    { jobId: 1, applicantId: 1 },
+    { unique: true },
+  );
+
+  // The seeker's own list, newest first
+  await applications.createIndex({ applicantId: 1, createdAt: -1 });
+
+  // One save per seeker per job
+  await savedJobs.createIndex({ applicantId: 1, jobId: 1 }, { unique: true });
 }
 
 // The Mongo adapter stores Better Auth ids as ObjectIds; sub is the hex string
