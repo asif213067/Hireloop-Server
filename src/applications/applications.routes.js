@@ -1,7 +1,13 @@
 import { Router } from "express";
 import { z } from "zod";
 
-import { applications, isObjectId, jobs, toObjectId } from "../db.js";
+import {
+  applications,
+  isObjectId,
+  jobs,
+  savedJobs,
+  toObjectId,
+} from "../db.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 import { requireRole } from "../middleware/requireRole.js";
 import { applyLimiter } from "../middleware/applyLimiter.js";
@@ -178,8 +184,52 @@ async function getApplicationStatus(req, res) {
   res.json({ applied: existing !== null });
 }
 
+// One activity row for the dashboard
+function toActivityItem(doc) {
+  return {
+    id: doc._id.toString(),
+    jobId: doc.jobId.toString(),
+    jobTitle: doc.jobTitle,
+    companyName: doc.companyName,
+    status: doc.status,
+    createdAt: doc.createdAt.toISOString(),
+    updatedAt: doc.updatedAt.toISOString(),
+  };
+}
+
+// Dashboard home: four counts and the latest activity
+async function getSeekerSummary(req, res) {
+  const applicantId = toObjectId(req.user.id);
+
+  // One group query gives every application count
+  const rows = await applications
+    .aggregate([{ $match: { applicantId } }, { $group: { _id: "$status", count: { $sum: 1 } } }])
+    .toArray();
+  const byStatus = Object.fromEntries(rows.map((row) => [row._id, row.count]));
+  const totalApplications = rows.reduce((sum, row) => sum + row.count, 0);
+
+  const savedCount = await savedJobs.countDocuments({ applicantId });
+
+  const recent = await applications
+    .find({ applicantId })
+    .sort({ updatedAt: -1, _id: -1 })
+    .limit(5)
+    .toArray();
+
+  res.json({
+    stats: {
+      savedJobs: savedCount,
+      applications: totalApplications,
+      interviews: byStatus.interview ?? 0,
+      offers: byStatus.offered ?? 0,
+    },
+    recent: recent.map(toActivityItem),
+  });
+}
+
 applicationsRouter.get("/mine", listMyApplications);
 applicationsRouter.get("/status/:jobId", getApplicationStatus);
 applicationsRouter.post("/", applyLimiter, requireJsonContentType, applyToJob);
+applicationsRouter.get("/summary", getSeekerSummary);
 
 export { applicationsRouter };
