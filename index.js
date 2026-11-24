@@ -13,6 +13,10 @@ import { publicJobsRouter } from "./src/public/publicJobs.routes.js";
 import { applicationsRouter } from "./src/applications/applications.routes.js";
 import { accountRouter } from "./src/account/account.routes.js";
 import { savedJobsRouter } from "./src/saved-jobs/saved-jobs.routes.js";
+import {
+  paymentsRouter,
+  paymentsWebhookHandler,
+} from "./src/payments/payments.routes.js";
 
 const app = express();
 const port = env.port;
@@ -36,6 +40,13 @@ app.use(
     allowedHeaders: ["Authorization", "Content-Type"],
     credentials: false,
   })
+);
+
+// Stripe Webhook: requires raw Buffer body for cryptographic signature verification
+app.post(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" }),
+  paymentsWebhookHandler
 );
 
 // Small JSON bodies only
@@ -74,6 +85,10 @@ app.use("/api/account", accountRouter);
 
 // Saved jobs: signed-in seekers only
 app.use("/api/saved-jobs", savedJobsRouter);
+
+// Payments & subscriptions: verification, billing history
+app.use("/api/payments", paymentsRouter);
+app.use("/payments", paymentsRouter); // Direct caller alias
 
 // JSON 404 for unknown routes
 app.use((req, res) => {
