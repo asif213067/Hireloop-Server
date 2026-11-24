@@ -171,7 +171,19 @@ export async function listUserPayments(req, res) {
     .limit(50)
     .toArray();
 
+  const userDoc = await users.findOne(
+    { _id: toObjectId(req.user.id) },
+    { projection: { subscription: 1, usage: 1 } }
+  );
+
   res.json({
+    subscription: userDoc?.subscription ||
+      req.user?.subscription || {
+        plan: "free",
+        status: "none",
+        billingInterval: null,
+      },
+    usage: userDoc?.usage || req.user?.usage || {},
     payments: rows.map((p) => ({
       id: p._id.toString(),
       stripeSessionId: p.stripeSessionId,
