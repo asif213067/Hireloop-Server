@@ -11,6 +11,10 @@ import {
 import { requireAuth } from "../middleware/requireAuth.js";
 import { requireRole } from "../middleware/requireRole.js";
 import { applyLimiter } from "../middleware/applyLimiter.js";
+import {
+  checkUsageLimit,
+  incrementMonthlyUsage,
+} from "../subscription/subscription.utils.js";
 
 const applicationsRouter = Router();
 
@@ -84,6 +88,16 @@ async function applyToJob(req, res) {
     return res.status(404).json({ error: "Job not available" });
   }
 
+  // Monthly application limit for Free plan candidates (Pro has unlimited)
+  const usageCheck = checkUsageLimit(req.user, "applications");
+  if (!usageCheck.allowed) {
+    return res.status(403).json({
+      error: "Monthly application limit reached",
+      message: `You have reached the monthly application limit of ${usageCheck.limit} jobs on the Free plan. Upgrade to Pro for unlimited applications.`,
+      usage: usageCheck,
+    });
+  }
+
   const now = new Date();
   const document = {
     jobId: job._id,
@@ -101,11 +115,21 @@ async function applyToJob(req, res) {
 
   try {
     const result = await applications.insertOne(document);
+    // Increment monthly counter atomically
+    await incrementMonthlyUsage(req.user.id, "applications");
+
     res.status(201).json({
       application: toApplicationResponse({
         ...document,
         _id: result.insertedId,
       }),
+      usage: {
+        ...usageCheck,
+        count: (usageCheck.count ?? 0) + 1,
+        remaining: usageCheck.isPro
+          ? null
+          : Math.max(0, (usageCheck.remaining ?? 1) - 1),
+      },
     });
   } catch (error) {
     // The unique index (jobId + applicantId) blocks a second application
@@ -223,6 +247,7 @@ async function getSeekerSummary(req, res) {
       interviews: byStatus.interview ?? 0,
       offers: byStatus.offered ?? 0,
     },
+    usage: checkUsageLimit(req.user, "applications"),
     recent: recent.map(toActivityItem),
   });
 }

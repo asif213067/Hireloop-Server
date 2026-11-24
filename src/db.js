@@ -19,6 +19,9 @@ export const applications = db.collection("applications");
 // One document per saved job: { jobId, applicantId, createdAt }
 export const savedJobs = db.collection("savedJobs");
 
+// Audit and billing records for Stripe transactions
+export const payments = db.collection("payments");
+
 export async function connectToMongoDB() {
   await mongoClient.connect();
   console.log("You successfully connected to MongoDB!");
@@ -65,6 +68,18 @@ export async function ensureJobIndexes() {
 
   // One save per seeker per job
   await savedJobs.createIndex({ applicantId: 1, jobId: 1 }, { unique: true });
+
+  // Stripe payments: prevent duplicate processing & fast user history lookups
+  await payments.createIndexes([
+    { key: { stripeSessionId: 1 }, unique: true, sparse: true },
+    { key: { userId: 1, createdAt: -1 } },
+  ]);
+
+  // Fast lookups for Stripe customer and subscription webhook events
+  await users.createIndexes([
+    { key: { "subscription.stripeCustomerId": 1 }, sparse: true },
+    { key: { "subscription.stripeSubscriptionId": 1 }, sparse: true },
+  ]);
 }
 
 // The Mongo adapter stores Better Auth ids as ObjectIds; sub is the hex string

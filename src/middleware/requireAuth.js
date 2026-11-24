@@ -36,7 +36,7 @@ export async function requireAuth(req, res, next) {
 
   const user = await users.findOne(
     { _id: toObjectId(payload.sub) },
-    { projection: { name: 1, email: 1, role: 1 } }
+    { projection: { name: 1, email: 1, role: 1, subscription: 1, usage: 1 } }
   );
   if (!user) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -44,6 +44,17 @@ export async function requireAuth(req, res, next) {
 
   // Only exact known roles keep their power; anything else is a seeker
   const role = ["seeker", "recruiter", "admin"].includes(user.role) ? user.role : "seeker";
-  req.user = { id: user._id.toString(), role, name: user.name, email: user.email };
+  req.user = {
+    id: user._id.toString(),
+    role,
+    name: user.name,
+    email: user.email,
+    subscription: user.subscription ?? {
+      plan: "free",
+      status: "none",
+      billingInterval: null,
+    },
+    usage: user.usage ?? {},
+  };
   next();
 }

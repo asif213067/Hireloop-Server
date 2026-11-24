@@ -8,6 +8,10 @@ import {
   perUserJobMutationLimiter,
 } from "../middleware/rateLimiters.js";
 import { jobSchema } from "./jobs.validation.js";
+import {
+  checkUsageLimit,
+  incrementMonthlyUsage,
+} from "../subscription/subscription.utils.js";
 
 const jobsRouter = Router();
 
@@ -182,6 +186,16 @@ async function deleteJob(req, res) {
 
 // Insert only the validated fields; server sets identity, status and timestamps
 async function createJob(req, res) {
+  // Enforce monthly job posting limit for Free tier recruiters (Pro has unlimited)
+  const usageCheck = checkUsageLimit(req.user, "jobPosts");
+  if (!usageCheck.allowed) {
+    return res.status(403).json({
+      error: "Monthly job posting limit reached",
+      message: `You have reached the monthly job posting limit of ${usageCheck.limit} jobs on the Free plan. Upgrade to Pro for unlimited job postings.`,
+      usage: usageCheck,
+    });
+  }
+
   const job = req.validatedJob;
   const now = new Date();
 
@@ -205,11 +219,20 @@ async function createJob(req, res) {
   };
 
   const result = await jobs.insertOne(document);
+  // Increment monthly counter atomically
+  await incrementMonthlyUsage(req.user.id, "jobPosts");
 
   // A new job has no applicants yet
-  res
-    .status(201)
-    .json({ job: toJobResponse({ ...document, _id: result.insertedId }, 0) });
+  res.status(201).json({
+    job: toJobResponse({ ...document, _id: result.insertedId }, 0),
+    usage: {
+      ...usageCheck,
+      count: (usageCheck.count ?? 0) + 1,
+      remaining: usageCheck.isPro
+        ? null
+        : Math.max(0, (usageCheck.remaining ?? 1) - 1),
+    },
+  });
 }
 
 // "/mine" must be declared before "/:id"

@@ -45,4 +45,8 @@ export const env = {
   clientOrigins,
   port: Number(process.env.PORT),
   trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
+  stripeSecretKey: (process.env.STRIPE_SECRET_KEY || "").trim(),
+  stripeWebhookSecret: (process.env.STRIPE_WEBHOOK_SECRET || "").trim(),
+  stripePriceSeeker: (process.env.STRIPE_PRICE_SEEKER || "").trim(),
+  stripePriceRecruiter: (process.env.STRIPE_PRICE_RECRUITER || "").trim(),
 };
