@@ -168,7 +168,7 @@ async function fulfillCheckout(session, callerUserId = null) {
 
   const cancelAtPeriodEnd = Boolean(sub?.cancel_at_period_end);
   const subStatus =
-    sub?.status === "canceled"
+    sub?.status === "canceled" || cancelAtPeriodEnd
       ? "canceled"
       : sub?.status === "past_due"
         ? "past_due"
@@ -266,15 +266,15 @@ export async function verifyCheckout(req, res) {
   }
 }
 
-// Payment history for the authenticated user, synced with Stripe and validated
-export async function listUserPayments(req, res) {
-  const userObjId = toObjectId(req.user.id);
-
-  const rows = await payments
-    .find({ userId: userObjId })
-    .sort({ createdAt: -1 })
-    .limit(50)
-    .toArray();
+// Shared helper: syncs with Stripe, repairs dates, enforces expiration, and returns validated subscription
+async function syncAndValidateSubscription(userObjId, rowsOverride = null) {
+  const rows =
+    rowsOverride ??
+    (await payments
+      .find({ userId: userObjId })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .toArray());
 
   const userDoc = await users.findOne(
     { _id: userObjId },
@@ -317,8 +317,8 @@ export async function listUserPayments(req, res) {
       if (isExpired) {
         plan = "free";
         status = "expired";
-      } else if (sub.status === "canceled") {
-        // Canceled in Stripe: if paid period hasn't ended, retain Pro until currentPeriodEnd!
+      } else if (sub.status === "canceled" || cancelAtPeriodEnd) {
+        // Canceled or pending cancellation in Stripe: retain Pro until currentPeriodEnd!
         plan = "pro";
         status = "canceled";
       } else if (sub.status === "active" || sub.status === "trialing") {
@@ -354,19 +354,18 @@ export async function listUserPayments(req, res) {
         cancelAtPeriodEnd,
       };
     } catch (err) {
-      console.warn("Stripe live sync in listUserPayments:", err.message);
+      console.warn("Stripe live sync in syncAndValidateSubscription:", err.message);
     }
   }
 
   // 2. Repair or backfill any invalid/missing dates in subscription
-  let validStart = toValidDate(subscription.currentPeriodStart) || fallbackStart;
+  const validStart = toValidDate(subscription.currentPeriodStart) || fallbackStart;
   let validEnd = toValidDate(subscription.currentPeriodEnd);
 
   if (!validEnd && validStart && billingInterval) {
     validEnd = calculateExactExpirationDate(validStart, billingInterval);
   }
 
-  // Persist repaired dates if DB had invalid/missing Date values while user is Pro
   const hadCorruptedDates =
     (subscription.currentPeriodStart != null &&
       !toValidDate(subscription.currentPeriodStart)) ||
@@ -404,15 +403,57 @@ export async function listUserPayments(req, res) {
     }
   }
 
-  res.json({
+  const isActivePro =
+    subscription.plan === "pro" &&
+    (!validEnd || validEnd.getTime() > Date.now()) &&
+    (subscription.status === "active" ||
+      subscription.status === "trialing" ||
+      subscription.status === "canceled");
+
+  return {
+    rows,
+    userDoc,
+    isActivePro,
+    validStart,
+    validEnd,
     subscription: {
-      plan: subscription.plan === "pro" ? "pro" : "free",
+      plan: isActivePro ? "pro" : "free",
       billingInterval: billingInterval || null,
       status: subscription.status || "none",
       currentPeriodStart: toIsoOrNull(validStart),
       currentPeriodEnd: toIsoOrNull(validEnd),
       cancelAtPeriodEnd: Boolean(subscription.cancelAtPeriodEnd),
+      stripeSubscriptionId: subscription.stripeSubscriptionId || null,
     },
+  };
+}
+
+function serializePublicSubscription(sub) {
+  return {
+    plan: sub.plan,
+    billingInterval: sub.billingInterval,
+    status: sub.status,
+    currentPeriodStart: sub.currentPeriodStart,
+    currentPeriodEnd: sub.currentPeriodEnd,
+    cancelAtPeriodEnd: sub.cancelAtPeriodEnd,
+  };
+}
+
+// Current validated subscription status for the authenticated user
+export async function getSubscriptionStatus(req, res) {
+  const userObjId = toObjectId(req.user.id);
+  const { subscription } = await syncAndValidateSubscription(userObjId);
+  res.json({ subscription: serializePublicSubscription(subscription) });
+}
+
+// Payment history for the authenticated user, synced with Stripe and validated
+export async function listUserPayments(req, res) {
+  const userObjId = toObjectId(req.user.id);
+  const { rows, userDoc, subscription } =
+    await syncAndValidateSubscription(userObjId);
+
+  res.json({
+    subscription: serializePublicSubscription(subscription),
     usage: userDoc?.usage || req.user?.usage || {},
     payments: rows.map((p) => ({
       id: p._id.toString(),
@@ -424,6 +465,142 @@ export async function listUserPayments(req, res) {
       status: p.status,
       createdAt: toIsoOrNull(p.createdAt) || new Date().toISOString(),
     })),
+  });
+}
+
+// Schedule subscription cancellation at the end of the current paid billing period
+export async function cancelSubscription(req, res) {
+  const userObjId = toObjectId(req.user.id);
+  const { isActivePro, validEnd, subscription } =
+    await syncAndValidateSubscription(userObjId);
+
+  if (!isActivePro) {
+    return res.status(400).json({
+      error: "No active Pro subscription found to cancel.",
+    });
+  }
+
+  if (subscription.cancelAtPeriodEnd || subscription.status === "canceled") {
+    return res.status(409).json({
+      error:
+        "Cancellation is already scheduled for the end of your current billing period.",
+    });
+  }
+
+  let updatedPeriodEnd = validEnd;
+
+  if (subscription.stripeSubscriptionId && stripe) {
+    try {
+      const updatedSub = await stripe.subscriptions.update(
+        subscription.stripeSubscriptionId,
+        { cancel_at_period_end: true }
+      );
+      const { currentPeriodEnd } = extractSubscriptionPeriod(
+        updatedSub,
+        subscription.currentPeriodStart,
+        subscription.billingInterval || "monthly"
+      );
+      updatedPeriodEnd = currentPeriodEnd;
+    } catch (err) {
+      console.error("Failed to cancel Stripe subscription:", err?.message || err);
+      return res.status(502).json({
+        error: "Could not schedule cancellation with Stripe. Please try again.",
+      });
+    }
+  }
+
+  await users.updateOne(
+    { _id: userObjId },
+    {
+      $set: {
+        "subscription.plan": "pro",
+        "subscription.status": "canceled",
+        "subscription.cancelAtPeriodEnd": true,
+        ...(updatedPeriodEnd ? { "subscription.currentPeriodEnd": updatedPeriodEnd } : {}),
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  const updatedSubscription = {
+    ...subscription,
+    plan: "pro",
+    status: "canceled",
+    cancelAtPeriodEnd: true,
+    currentPeriodEnd: toIsoOrNull(updatedPeriodEnd),
+  };
+
+  res.json({
+    message:
+      "Your subscription renewal has been canceled. You will retain Pro access until the end of your current billing period.",
+    subscription: serializePublicSubscription(updatedSubscription),
+  });
+}
+
+// Reactivate a pending-cancellation subscription before its paid period expires
+export async function reactivateSubscription(req, res) {
+  const userObjId = toObjectId(req.user.id);
+  const { isActivePro, subscription } =
+    await syncAndValidateSubscription(userObjId);
+
+  if (!isActivePro) {
+    return res.status(400).json({
+      error:
+        "Your subscription has already expired. Please choose a plan to subscribe again.",
+    });
+  }
+
+  if (!subscription.cancelAtPeriodEnd && subscription.status !== "canceled") {
+    return res.status(409).json({
+      error: "Your subscription is already active and not scheduled for cancellation.",
+    });
+  }
+
+  if (subscription.stripeSubscriptionId && stripe) {
+    try {
+      const currentSub = await stripe.subscriptions.retrieve(
+        subscription.stripeSubscriptionId
+      );
+      if (currentSub.status === "canceled") {
+        return res.status(400).json({
+          error:
+            "This subscription has already been finalized in Stripe and cannot be reactivated. You can purchase a new plan after your current period expires.",
+        });
+      }
+      await stripe.subscriptions.update(subscription.stripeSubscriptionId, {
+        cancel_at_period_end: false,
+      });
+    } catch (err) {
+      console.error("Failed to reactivate Stripe subscription:", err?.message || err);
+      return res.status(502).json({
+        error: "Could not reactivate subscription with Stripe. Please try again.",
+      });
+    }
+  }
+
+  await users.updateOne(
+    { _id: userObjId },
+    {
+      $set: {
+        "subscription.plan": "pro",
+        "subscription.status": "active",
+        "subscription.cancelAtPeriodEnd": false,
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  const updatedSubscription = {
+    ...subscription,
+    plan: "pro",
+    status: "active",
+    cancelAtPeriodEnd: false,
+  };
+
+  res.json({
+    message:
+      "Your subscription has been reactivated. Your existing plan will continue without interruption.",
+    subscription: serializePublicSubscription(updatedSubscription),
   });
 }
 
@@ -479,9 +656,10 @@ export async function paymentsWebhookHandler(req, res) {
         if (isExpired) {
           plan = "free";
           status = "expired";
-        } else if (status === "canceled") {
-          // If canceled in Stripe, retain Pro until paid period ends!
+        } else if (status === "canceled" || cancelAtPeriodEnd) {
+          // If canceled or pending cancellation in Stripe, retain Pro until paid period ends!
           plan = "pro";
+          status = "canceled";
         }
 
         await users.updateOne(
@@ -540,6 +718,9 @@ export async function paymentsWebhookHandler(req, res) {
 
 // User routes
 paymentsRouter.post("/checkout-verify", verifyCheckout);
+paymentsRouter.get("/subscription", requireAuth, getSubscriptionStatus);
 paymentsRouter.get("/history", requireAuth, listUserPayments);
+paymentsRouter.post("/cancel", requireAuth, cancelSubscription);
+paymentsRouter.post("/reactivate", requireAuth, reactivateSubscription);
 
 export { paymentsRouter };
