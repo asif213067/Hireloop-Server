@@ -11,6 +11,7 @@ import { globalLimiter } from "./src/middleware/rateLimiters.js";
 import { jobsRouter } from "./src/jobs/jobs.routes.js";
 import { publicJobsRouter } from "./src/public/publicJobs.routes.js";
 import { applicationsRouter } from "./src/applications/applications.routes.js";
+import { recruiterApplicationsRouter } from "./src/applications/recruiterApplications.routes.js";
 import { accountRouter } from "./src/account/account.routes.js";
 import { savedJobsRouter } from "./src/saved-jobs/saved-jobs.routes.js";
 import {
@@ -36,7 +37,7 @@ app.use(helmet());
 app.use(
   cors({
     origin: env.clientOrigins,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Authorization", "Content-Type"],
     credentials: false,
   })
@@ -79,6 +80,9 @@ app.use("/api/jobs", jobsRouter);
 
 // Seeker applications: signed-in seekers only
 app.use("/api/applications", applicationsRouter);
+
+// Recruiter applications: signed-in recruiters managing applicants for their jobs
+app.use("/api/recruiter/applications", recruiterApplicationsRouter);
 
 // Account type changes: any signed-in user switches seeker/recruiter
 app.use("/api/account", accountRouter);
