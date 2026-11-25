@@ -21,17 +21,21 @@ export function isProUser(user) {
   const { plan, status, currentPeriodEnd } = user.subscription;
 
   if (plan !== "pro") return false;
-  if (status !== "active" && status !== "trialing") return false;
 
-  // A canceled subscription retains Pro access until the current period expires
+  // A plan that has passed its expiration date is no longer Pro
   if (currentPeriodEnd) {
     const expiresAt = new Date(currentPeriodEnd).getTime();
-    if (!Number.isNaN(expiresAt) && expiresAt < Date.now()) {
+    if (!Number.isNaN(expiresAt) && expiresAt <= Date.now()) {
       return false;
     }
   }
 
-  return true;
+  // Active, trialing, or canceled (before expiration) count as Pro
+  if (status === "active" || status === "trialing" || status === "canceled") {
+    return true;
+  }
+
+  return false;
 }
 
 // Checks if the user is allowed to perform the given action ("applications" or "jobPosts")

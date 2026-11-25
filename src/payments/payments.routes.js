@@ -2,7 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 
 import { env } from "../env.js";
-import { payments, toObjectId, users } from "../db.js";
+import { isObjectId, payments, toObjectId, users } from "../db.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 import { stripe } from "./stripe.js";
 
@@ -14,9 +14,85 @@ const verifySchema = z
   })
   .strict();
 
+// Safely converts Date, unix timestamp (seconds or ms), or ISO string to a valid Date, or null
+export function toValidDate(value) {
+  if (value == null) return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value <= 0) return null;
+    // Stripe timestamps are in seconds (< 1e12); JS timestamps are in milliseconds
+    const ms = value < 1e12 ? value * 1000 : value;
+    const d = new Date(ms);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const d = new Date(trimmed);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return null;
+}
+
+function toIsoOrNull(value) {
+  const d = toValidDate(value);
+  return d ? d.toISOString() : null;
+}
+
+// Helper: calculates the exact calendar expiration date (1 month or 1 year)
+export function calculateExactExpirationDate(startDate, interval) {
+  const base = toValidDate(startDate) || new Date();
+  const d = new Date(base.getTime());
+  if (interval === "yearly") {
+    const targetMonth = d.getMonth();
+    d.setFullYear(d.getFullYear() + 1);
+    // Clamp Feb 29 -> Feb 28 on non-leap years
+    if (d.getMonth() !== targetMonth) {
+      d.setDate(0);
+    }
+  } else {
+    const targetMonth = (d.getMonth() + 1) % 12;
+    d.setMonth(d.getMonth() + 1);
+    // Clamp month-end overflow (e.g. Jan 31 -> Feb 28/29 instead of Mar 3)
+    if (d.getMonth() !== targetMonth) {
+      d.setDate(0);
+    }
+  }
+  return d;
+}
+
+// Extracts subscription period start & end across Stripe API versions
+// Note: Stripe API >= 2025-03-31.basil moved current_period_start/end onto items.data[0]
+export function extractSubscriptionPeriod(sub, fallbackStartDate, billingInterval) {
+  const item0 = sub?.items?.data?.[0];
+
+  const rawStart =
+    sub?.current_period_start ??
+    item0?.current_period_start ??
+    sub?.start_date ??
+    sub?.created ??
+    null;
+
+  const currentPeriodStart =
+    toValidDate(rawStart) || toValidDate(fallbackStartDate) || new Date();
+
+  const rawEnd =
+    sub?.current_period_end ??
+    item0?.current_period_end ??
+    null;
+
+  const currentPeriodEnd =
+    toValidDate(rawEnd) ||
+    calculateExactExpirationDate(currentPeriodStart, billingInterval);
+
+  return { currentPeriodStart, currentPeriodEnd };
+}
+
 // Helper: syncs payment record and user subscription in MongoDB
 async function fulfillCheckout(session, callerUserId = null) {
-  const userId =
+  const rawUserId =
     session.metadata?.userId ||
     session.client_reference_id ||
     callerUserId ||
@@ -40,9 +116,41 @@ async function fulfillCheckout(session, callerUserId = null) {
   const customerEmail =
     session.customer_details?.email || session.customer_email || "";
 
+  let userObjectId =
+    typeof rawUserId === "string" && isObjectId(rawUserId)
+      ? toObjectId(rawUserId)
+      : null;
+
+  if (!userObjectId && customerEmail) {
+    const userByEmail = await users.findOne(
+      { email: customerEmail },
+      { projection: { _id: 1 } }
+    );
+    if (userByEmail) {
+      userObjectId = userByEmail._id;
+    }
+  }
+
+  const purchaseDate = toValidDate(session.created) || new Date();
+
+  // Retrieve full Stripe subscription details if available
+  let sub = null;
+  if (session.subscription && typeof session.subscription === "object") {
+    sub = session.subscription;
+  } else if (subscriptionId && stripe) {
+    try {
+      sub = await stripe.subscriptions.retrieve(subscriptionId);
+    } catch {
+      sub = null;
+    }
+  }
+
+  const stripeInterval = sub?.items?.data?.[0]?.price?.recurring?.interval;
+
   // Derive billing interval
   const billingInterval =
     session.metadata?.billingInterval === "yearly" ||
+    stripeInterval === "year" ||
     (session.amount_total && session.amount_total > 5000)
       ? "yearly"
       : "monthly";
@@ -52,31 +160,23 @@ async function fulfillCheckout(session, callerUserId = null) {
       ? "Hireloop Pro (Yearly)"
       : "Hireloop Pro (Monthly)";
 
-  // Calculate current period end
-  let currentPeriodEnd = null;
-  if (session.subscription && typeof session.subscription === "object") {
-    currentPeriodEnd = new Date(session.subscription.current_period_end * 1000);
-  } else if (subscriptionId && stripe) {
-    try {
-      const sub = await stripe.subscriptions.retrieve(subscriptionId);
-      currentPeriodEnd = new Date(sub.current_period_end * 1000);
-    } catch {
-      // Fallback: 1 month or 1 year from now
-      currentPeriodEnd = new Date(
-        Date.now() +
-          (billingInterval === "yearly" ? 365 : 30) * 24 * 60 * 60 * 1000
-      );
-    }
-  } else {
-    currentPeriodEnd = new Date(
-      Date.now() +
-        (billingInterval === "yearly" ? 365 : 30) * 24 * 60 * 60 * 1000
-    );
-  }
+  const { currentPeriodStart, currentPeriodEnd } = extractSubscriptionPeriod(
+    sub,
+    purchaseDate,
+    billingInterval
+  );
+
+  const cancelAtPeriodEnd = Boolean(sub?.cancel_at_period_end);
+  const subStatus =
+    sub?.status === "canceled"
+      ? "canceled"
+      : sub?.status === "past_due"
+        ? "past_due"
+        : "active";
 
   // 1. Idempotently record payment in payments collection
   const paymentDoc = {
-    userId: userId ? toObjectId(userId) : null,
+    userId: userObjectId,
     stripeSessionId: session.id,
     stripePaymentIntentId: paymentIntentId,
     stripeInvoiceId: invoiceId,
@@ -87,7 +187,7 @@ async function fulfillCheckout(session, callerUserId = null) {
     billingInterval,
     status: "succeeded",
     customerEmail,
-    createdAt: new Date(),
+    createdAt: purchaseDate,
   };
 
   await payments.updateOne(
@@ -96,27 +196,30 @@ async function fulfillCheckout(session, callerUserId = null) {
     { upsert: true }
   );
 
-  // 2. Upgrade user document to Pro tier
-  if (userId) {
+  // 2. Upgrade user document to Pro tier with exact validated dates
+  if (userObjectId) {
     await users.updateOne(
-      { _id: toObjectId(userId) },
+      { _id: userObjectId },
       {
         $set: {
           "subscription.plan": "pro",
           "subscription.billingInterval": billingInterval,
-          "subscription.status": "active",
+          "subscription.status": subStatus,
           "subscription.stripeCustomerId":
-            typeof session.customer === "string" ? session.customer : null,
+            typeof session.customer === "string"
+              ? session.customer
+              : session.customer?.id ?? null,
           "subscription.stripeSubscriptionId": subscriptionId,
+          "subscription.currentPeriodStart": currentPeriodStart,
           "subscription.currentPeriodEnd": currentPeriodEnd,
-          "subscription.cancelAtPeriodEnd": false,
+          "subscription.cancelAtPeriodEnd": cancelAtPeriodEnd,
           updatedAt: new Date(),
         },
       }
     );
   }
 
-  return { ...paymentDoc, currentPeriodEnd };
+  return { ...paymentDoc, currentPeriodStart, currentPeriodEnd };
 }
 
 // Verification endpoint called by the client upon landing on /checkout/success
@@ -163,26 +266,153 @@ export async function verifyCheckout(req, res) {
   }
 }
 
-// Payment history for the authenticated user
+// Payment history for the authenticated user, synced with Stripe and validated
 export async function listUserPayments(req, res) {
+  const userObjId = toObjectId(req.user.id);
+
   const rows = await payments
-    .find({ userId: toObjectId(req.user.id) })
+    .find({ userId: userObjId })
     .sort({ createdAt: -1 })
     .limit(50)
     .toArray();
 
   const userDoc = await users.findOne(
-    { _id: toObjectId(req.user.id) },
+    { _id: userObjId },
     { projection: { subscription: 1, usage: 1 } }
   );
 
-  res.json({
-    subscription: userDoc?.subscription ||
-      req.user?.subscription || {
+  let subscription = userDoc?.subscription
+    ? { ...userDoc.subscription }
+    : {
         plan: "free",
         status: "none",
         billingInterval: null,
-      },
+      };
+
+  const latestPayment = rows[0] || null;
+  const fallbackStart = toValidDate(latestPayment?.createdAt);
+  let billingInterval =
+    subscription.billingInterval || latestPayment?.billingInterval || null;
+
+  // 1. Live Stripe synchronization if Stripe subscription ID exists
+  if (subscription.stripeSubscriptionId && stripe) {
+    try {
+      const sub = await stripe.subscriptions.retrieve(
+        subscription.stripeSubscriptionId
+      );
+      const stripeInterval = sub?.items?.data?.[0]?.price?.recurring?.interval;
+      if (!billingInterval && stripeInterval) {
+        billingInterval = stripeInterval === "year" ? "yearly" : "monthly";
+      }
+
+      const { currentPeriodStart: subPeriodStart, currentPeriodEnd: subPeriodEnd } =
+        extractSubscriptionPeriod(sub, fallbackStart, billingInterval || "monthly");
+
+      const isExpired = subPeriodEnd.getTime() <= Date.now();
+      const cancelAtPeriodEnd = Boolean(sub.cancel_at_period_end);
+
+      let plan = "pro";
+      let status = sub.status;
+
+      if (isExpired) {
+        plan = "free";
+        status = "expired";
+      } else if (sub.status === "canceled") {
+        // Canceled in Stripe: if paid period hasn't ended, retain Pro until currentPeriodEnd!
+        plan = "pro";
+        status = "canceled";
+      } else if (sub.status === "active" || sub.status === "trialing") {
+        plan = "pro";
+        status = "active";
+      } else {
+        plan = "free";
+        status = sub.status || "none";
+      }
+
+      await users.updateOne(
+        { _id: userObjId },
+        {
+          $set: {
+            "subscription.plan": plan,
+            "subscription.billingInterval": billingInterval,
+            "subscription.status": status,
+            "subscription.currentPeriodStart": subPeriodStart,
+            "subscription.currentPeriodEnd": subPeriodEnd,
+            "subscription.cancelAtPeriodEnd": cancelAtPeriodEnd,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      subscription = {
+        ...subscription,
+        plan,
+        billingInterval,
+        status,
+        currentPeriodStart: subPeriodStart,
+        currentPeriodEnd: subPeriodEnd,
+        cancelAtPeriodEnd,
+      };
+    } catch (err) {
+      console.warn("Stripe live sync in listUserPayments:", err.message);
+    }
+  }
+
+  // 2. Repair or backfill any invalid/missing dates in subscription
+  let validStart = toValidDate(subscription.currentPeriodStart) || fallbackStart;
+  let validEnd = toValidDate(subscription.currentPeriodEnd);
+
+  if (!validEnd && validStart && billingInterval) {
+    validEnd = calculateExactExpirationDate(validStart, billingInterval);
+  }
+
+  // Persist repaired dates if DB had invalid/missing Date values while user is Pro
+  const hadCorruptedDates =
+    (subscription.currentPeriodStart != null &&
+      !toValidDate(subscription.currentPeriodStart)) ||
+    (subscription.currentPeriodEnd != null &&
+      !toValidDate(subscription.currentPeriodEnd));
+
+  if (hadCorruptedDates && validStart && validEnd) {
+    await users.updateOne(
+      { _id: userObjId },
+      {
+        $set: {
+          "subscription.currentPeriodStart": validStart,
+          "subscription.currentPeriodEnd": validEnd,
+          updatedAt: new Date(),
+        },
+      }
+    );
+  }
+
+  // 3. Validate expiration date against current time
+  if (validEnd && validEnd.getTime() <= Date.now()) {
+    if (subscription.plan === "pro") {
+      await users.updateOne(
+        { _id: userObjId },
+        {
+          $set: {
+            "subscription.plan": "free",
+            "subscription.status": "expired",
+            updatedAt: new Date(),
+          },
+        }
+      );
+      subscription.plan = "free";
+      subscription.status = "expired";
+    }
+  }
+
+  res.json({
+    subscription: {
+      plan: subscription.plan === "pro" ? "pro" : "free",
+      billingInterval: billingInterval || null,
+      status: subscription.status || "none",
+      currentPeriodStart: toIsoOrNull(validStart),
+      currentPeriodEnd: toIsoOrNull(validEnd),
+      cancelAtPeriodEnd: Boolean(subscription.cancelAtPeriodEnd),
+    },
     usage: userDoc?.usage || req.user?.usage || {},
     payments: rows.map((p) => ({
       id: p._id.toString(),
@@ -192,7 +422,7 @@ export async function listUserPayments(req, res) {
       planName: p.planName,
       billingInterval: p.billingInterval,
       status: p.status,
-      createdAt: p.createdAt.toISOString(),
+      createdAt: toIsoOrNull(p.createdAt) || new Date().toISOString(),
     })),
   });
 }
@@ -228,21 +458,42 @@ export async function paymentsWebhookHandler(req, res) {
 
       case "customer.subscription.updated": {
         const sub = event.data.object;
-        const currentPeriodEnd = new Date(sub.current_period_end * 1000);
-        const status =
+        const stripeInterval = sub?.items?.data?.[0]?.price?.recurring?.interval;
+        const billingInterval = stripeInterval === "year" ? "yearly" : "monthly";
+        const { currentPeriodStart, currentPeriodEnd } = extractSubscriptionPeriod(
+          sub,
+          new Date(),
+          billingInterval
+        );
+        const isExpired = currentPeriodEnd.getTime() <= Date.now();
+        const cancelAtPeriodEnd = Boolean(sub.cancel_at_period_end);
+
+        let status =
           sub.status === "active" || sub.status === "trialing"
             ? "active"
             : sub.status === "past_due"
               ? "past_due"
               : "canceled";
 
+        let plan = "pro";
+        if (isExpired) {
+          plan = "free";
+          status = "expired";
+        } else if (status === "canceled") {
+          // If canceled in Stripe, retain Pro until paid period ends!
+          plan = "pro";
+        }
+
         await users.updateOne(
           { "subscription.stripeSubscriptionId": sub.id },
           {
             $set: {
+              "subscription.plan": plan,
+              "subscription.billingInterval": billingInterval,
               "subscription.status": status,
+              "subscription.currentPeriodStart": currentPeriodStart,
               "subscription.currentPeriodEnd": currentPeriodEnd,
-              "subscription.cancelAtPeriodEnd": Boolean(sub.cancel_at_period_end),
+              "subscription.cancelAtPeriodEnd": cancelAtPeriodEnd,
               updatedAt: new Date(),
             },
           }
@@ -252,12 +503,23 @@ export async function paymentsWebhookHandler(req, res) {
 
       case "customer.subscription.deleted": {
         const sub = event.data.object;
+        const stripeInterval = sub?.items?.data?.[0]?.price?.recurring?.interval;
+        const billingInterval = stripeInterval === "year" ? "yearly" : "monthly";
+        const { currentPeriodEnd } = extractSubscriptionPeriod(
+          sub,
+          new Date(),
+          billingInterval
+        );
+        const isExpired = currentPeriodEnd.getTime() <= Date.now();
+
         await users.updateOne(
           { "subscription.stripeSubscriptionId": sub.id },
           {
             $set: {
-              "subscription.plan": "free",
-              "subscription.status": "canceled",
+              "subscription.plan": isExpired ? "free" : "pro",
+              "subscription.status": isExpired ? "expired" : "canceled",
+              "subscription.currentPeriodEnd": currentPeriodEnd,
+              "subscription.cancelAtPeriodEnd": true,
               updatedAt: new Date(),
             },
           }
@@ -276,7 +538,7 @@ export async function paymentsWebhookHandler(req, res) {
   }
 }
 
-// User routes (require authentication)
+// User routes
 paymentsRouter.post("/checkout-verify", verifyCheckout);
 paymentsRouter.get("/history", requireAuth, listUserPayments);
 
