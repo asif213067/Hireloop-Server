@@ -4,16 +4,105 @@ import { z } from "zod";
 import { jobs, toObjectId, users } from "../db.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 import { accountLimiter } from "../middleware/accountLimiter.js";
+import { profileMutationLimiter } from "../middleware/rateLimiters.js";
 
 const accountRouter = Router();
 
-// Any signed-in user may change their own account type
+// Any signed-in user may manage their own account
 accountRouter.use(requireAuth);
 
 // Role change body: only the new role is accepted
 const roleSchema = z.object({ role: z.enum(["seeker", "recruiter"]) }).strict();
 
-// PUT bodies must be application/json
+// Optional http/https URL or empty string
+const optionalUrlSchema = z
+  .string()
+  .trim()
+  .max(300)
+  .refine(
+    (val) => {
+      if (val === "") return true;
+      try {
+        const parsed = new URL(val);
+        return parsed.protocol === "http:" || parsed.protocol === "https:";
+      } catch {
+        return false;
+      }
+    },
+    { message: "Must be a valid http(s) URL" }
+  );
+
+const personalProfileSchema = z
+  .object({
+    name: z.string().trim().min(2, "Name must be 2 to 80 characters").max(80),
+    phone: z.string().trim().max(30).default(""),
+    city: z.string().trim().max(80).default(""),
+    country: z.string().trim().max(80).default(""),
+  })
+  .strict();
+
+const experienceEntrySchema = z
+  .object({
+    id: z.string().trim().min(1).max(60),
+    jobTitle: z.string().trim().min(1).max(100),
+    company: z.string().trim().min(1).max(100),
+    employmentType: z.string().trim().max(40).default("Full-time"),
+    location: z.string().trim().max(100).default(""),
+    startDate: z.string().trim().max(20).default(""),
+    endDate: z.string().trim().max(20).default(""),
+    currentlyWorking: z.boolean().default(false),
+    description: z.string().trim().max(800).default(""),
+  })
+  .strict();
+
+const educationEntrySchema = z
+  .object({
+    id: z.string().trim().min(1).max(60),
+    institution: z.string().trim().min(1).max(120),
+    degree: z.string().trim().min(1).max(80),
+    fieldOfStudy: z.string().trim().max(100).default(""),
+    startDate: z.string().trim().max(20).default(""),
+    endDate: z.string().trim().max(20).default(""),
+    description: z.string().trim().max(600).default(""),
+  })
+  .strict();
+
+const projectEntrySchema = z
+  .object({
+    id: z.string().trim().min(1).max(60),
+    name: z.string().trim().min(1).max(100),
+    description: z.string().trim().max(800).default(""),
+    technologies: z.array(z.string().trim().min(1).max(40)).max(20).default([]),
+    url: optionalUrlSchema.default(""),
+  })
+  .strict();
+
+const professionalProfileSchema = z
+  .object({
+    headline: z.string().trim().max(120).default(""),
+    bio: z.string().trim().max(2000).default(""),
+    skills: z.array(z.string().trim().min(1).max(50)).max(50).default([]),
+    experience: z.array(experienceEntrySchema).max(30).default([]),
+    education: z.array(educationEntrySchema).max(20).default([]),
+    projects: z.array(projectEntrySchema).max(20).default([]),
+    links: z
+      .object({
+        portfolioUrl: optionalUrlSchema.default(""),
+        linkedinUrl: optionalUrlSchema.default(""),
+        githubUrl: optionalUrlSchema.default(""),
+        otherUrl: optionalUrlSchema.default(""),
+      })
+      .strict()
+      .default({
+        portfolioUrl: "",
+        linkedinUrl: "",
+        githubUrl: "",
+        otherUrl: "",
+      }),
+  })
+  .strict();
+
+// JSON bodies must be application/json
 function requireJsonContentType(req, res, next) {
   const contentType = req.headers["content-type"] || "";
   if (!contentType.startsWith("application/json")) {
@@ -57,6 +146,117 @@ async function changeRole(req, res) {
   res.status(200).json({ role });
 }
 
+// Fetch authenticated user's profile (personal + professional fields only)
+async function getProfile(req, res) {
+  const userDoc = await users.findOne(
+    { _id: toObjectId(req.user.id) },
+    {
+      projection: {
+        name: 1,
+        email: 1,
+        image: 1,
+        phone: 1,
+        city: 1,
+        country: 1,
+        profile: 1,
+      },
+    }
+  );
+
+  if (!userDoc) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  const prof = userDoc.profile || {};
+  res.json({
+    profile: {
+      name: userDoc.name || "",
+      email: userDoc.email || "",
+      image: userDoc.image || null,
+      phone: userDoc.phone || "",
+      city: userDoc.city || "",
+      country: userDoc.country || "",
+      headline: prof.headline || "",
+      bio: prof.bio || "",
+      skills: Array.isArray(prof.skills) ? prof.skills : [],
+      experience: Array.isArray(prof.experience) ? prof.experience : [],
+      education: Array.isArray(prof.education) ? prof.education : [],
+      projects: Array.isArray(prof.projects) ? prof.projects : [],
+      links: {
+        portfolioUrl: prof.links?.portfolioUrl || "",
+        linkedinUrl: prof.links?.linkedinUrl || "",
+        githubUrl: prof.links?.githubUrl || "",
+        otherUrl: prof.links?.otherUrl || "",
+      },
+    },
+  });
+}
+
+// Update authenticated user's personal information (email, role, subscription untouched)
+async function updatePersonalProfile(req, res) {
+  const parsed = personalProfileSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const message = parsed.error.issues[0]?.message || "Invalid personal details";
+    return res.status(400).json({ error: message });
+  }
+
+  const { name, phone, city, country } = parsed.data;
+
+  await users.updateOne(
+    { _id: toObjectId(req.user.id) },
+    {
+      $set: {
+        name,
+        phone,
+        city,
+        country,
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  res.json({
+    personal: { name, phone, city, country },
+  });
+}
+
+// Update authenticated user's professional details
+async function updateProfessionalProfile(req, res) {
+  const parsed = professionalProfileSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const message =
+      parsed.error.issues[0]?.message || "Invalid professional details";
+    return res.status(400).json({ error: message });
+  }
+
+  await users.updateOne(
+    { _id: toObjectId(req.user.id) },
+    {
+      $set: {
+        profile: parsed.data,
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  res.json({
+    professional: parsed.data,
+  });
+}
+
 accountRouter.put("/role", accountLimiter, requireJsonContentType, changeRole);
+accountRouter.get("/profile", getProfile);
+accountRouter.put(
+  "/profile/personal",
+  profileMutationLimiter,
+  requireJsonContentType,
+  updatePersonalProfile
+);
+accountRouter.put(
+  "/profile/professional",
+  profileMutationLimiter,
+  requireJsonContentType,
+  updateProfessionalProfile
+);
 
 export { accountRouter };

@@ -33,3 +33,13 @@ export const perUserJobMutationLimiter = rateLimit({
   keyGenerator: (req) => req.user.id,
   handler: tooMany,
 });
+
+// Per user: 60 profile updates per 15 minutes; runs after requireAuth so req.user.id exists
+export const profileMutationLimiter = rateLimit({
+  limit: 60,
+  windowMs: 15 * 60 * 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user.id,
+  handler: tooMany,
+});

@@ -135,7 +135,7 @@ async function listRecruiterApplications(req, res) {
       ? await users
           .find(
             { _id: { $in: applicantIds } },
-            { projection: { name: 1, email: 1 } }
+            { projection: { name: 1, email: 1, image: 1 } }
           )
           .toArray()
       : [];
@@ -143,7 +143,11 @@ async function listRecruiterApplications(req, res) {
   const applicantMap = new Map(
     applicantDocs.map((u) => [
       u._id.toString(),
-      { name: u.name || "Candidate", email: u.email || "" },
+      {
+        name: u.name || "Candidate",
+        email: u.email || "",
+        image: u.image || null,
+      },
     ])
   );
 
@@ -152,6 +156,7 @@ async function listRecruiterApplications(req, res) {
       const applicant = applicantMap.get(doc.applicantId?.toString()) || {
         name: "Candidate",
         email: "",
+        image: null,
       };
       return {
         id: doc._id.toString(),
@@ -159,6 +164,7 @@ async function listRecruiterApplications(req, res) {
         applicantId: doc.applicantId.toString(),
         applicantName: applicant.name,
         applicantEmail: applicant.email,
+        applicantImage: applicant.image,
         status: doc.status,
         createdAt: doc.createdAt.toISOString(),
         updatedAt: (doc.updatedAt || doc.createdAt).toISOString(),
