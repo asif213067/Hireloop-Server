@@ -77,6 +77,14 @@ const projectEntrySchema = z
   })
   .strict();
 
+const languageEntrySchema = z
+  .object({
+    id: z.string().trim().min(1).max(60),
+    name: z.string().trim().min(1).max(60),
+    proficiency: z.enum(["Native", "Intermediate", "Professional"]),
+  })
+  .strict();
+
 const professionalProfileSchema = z
   .object({
     headline: z.string().trim().max(120).default(""),
@@ -85,6 +93,7 @@ const professionalProfileSchema = z
     experience: z.array(experienceEntrySchema).max(30).default([]),
     education: z.array(educationEntrySchema).max(20).default([]),
     projects: z.array(projectEntrySchema).max(20).default([]),
+    languages: z.array(languageEntrySchema).max(30).default([]),
     links: z
       .object({
         portfolioUrl: optionalUrlSchema.default(""),
@@ -182,6 +191,7 @@ async function getProfile(req, res) {
       experience: Array.isArray(prof.experience) ? prof.experience : [],
       education: Array.isArray(prof.education) ? prof.education : [],
       projects: Array.isArray(prof.projects) ? prof.projects : [],
+      languages: Array.isArray(prof.languages) ? prof.languages : [],
       links: {
         portfolioUrl: prof.links?.portfolioUrl || "",
         linkedinUrl: prof.links?.linkedinUrl || "",

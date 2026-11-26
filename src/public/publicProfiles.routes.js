@@ -52,6 +52,7 @@ async function getPublicSeekerProfile(req, res) {
       experience: Array.isArray(prof.experience) ? prof.experience : [],
       education: Array.isArray(prof.education) ? prof.education : [],
       projects: Array.isArray(prof.projects) ? prof.projects : [],
+      languages: Array.isArray(prof.languages) ? prof.languages : [],
       links: {
         portfolioUrl: prof.links?.portfolioUrl || "",
         linkedinUrl: prof.links?.linkedinUrl || "",
