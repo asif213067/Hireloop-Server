@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 
-import { isObjectId, jobs, toObjectId } from "../db.js";
+import { isObjectId, jobs, toObjectId, users } from "../db.js";
 import { publicLimiter } from "../middleware/publicLimiter.js";
 
 const publicJobsRouter = Router();
@@ -171,11 +171,39 @@ async function getPublicJob(req, res) {
     return res.status(404).json({ error: "Not found" });
   }
 
+  const recruiter = job.recruiterId
+    ? await users.findOne(
+        { _id: job.recruiterId },
+        { projection: { company: 1 } },
+      )
+    : null;
+
+  const rawCompany = recruiter?.company;
+  const company =
+    rawCompany && typeof rawCompany === "object"
+      ? {
+          name: typeof rawCompany.name === "string" ? rawCompany.name : "",
+          logo: typeof rawCompany.logo === "string" ? rawCompany.logo : "",
+          industry:
+            typeof rawCompany.industry === "string" ? rawCompany.industry : "",
+          size: typeof rawCompany.size === "string" ? rawCompany.size : "",
+          location:
+            typeof rawCompany.location === "string" ? rawCompany.location : "",
+          website:
+            typeof rawCompany.website === "string" ? rawCompany.website : "",
+          description:
+            typeof rawCompany.description === "string"
+              ? rawCompany.description
+              : "",
+        }
+      : null;
+
   res.json({
     job: {
       ...toPublicJob(job),
       responsibilities: job.responsibilities,
       requirements: job.requirements,
+      company,
     },
   });
 }
