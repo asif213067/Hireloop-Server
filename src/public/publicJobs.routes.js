@@ -208,7 +208,168 @@ async function getPublicJob(req, res) {
   });
 }
 
+const ROLE_SYNONYMS = {
+  software: ["developer", "engineer", "frontend", "backend", "full-stack", "fullstack", "web", "swe"],
+  engineer: ["developer", "software", "frontend", "backend", "full-stack", "fullstack", "devops"],
+  developer: ["engineer", "software", "frontend", "backend", "full-stack", "fullstack", "web"],
+  frontend: ["front-end", "react", "next", "typescript", "javascript", "ui"],
+  backend: ["back-end", "node", "api", "python", "java", "go", "database"],
+  fullstack: ["full-stack", "frontend", "backend", "software", "developer"],
+  data: ["analyst", "analytics", "business analyst", "bi", "sql", "science"],
+  analyst: ["analytics", "business analyst", "data", "bi", "reporting"],
+  analytics: ["analyst", "data", "business analyst", "bi"],
+  designer: ["design", "ui", "ux", "product designer", "figma"],
+  design: ["designer", "ui", "ux", "product designer", "figma"],
+  product: ["product manager", "product management", "pm"],
+  marketing: ["growth", "seo", "content", "digital marketing"],
+  devops: ["sre", "cloud", "kubernetes", "aws", "infrastructure"],
+};
+
+const STOP_WORDS = new Set([
+  "senior",
+  "junior",
+  "lead",
+  "mid",
+  "level",
+  "intern",
+  "the",
+  "and",
+  "for",
+  "with",
+  "of",
+  "in",
+  "at",
+  "to",
+]);
+
+function buildMatchKeywords(headline = "", skills = []) {
+  const tokens = new Set();
+  const rawParts = [headline, ...skills]
+    .join(" ")
+    .toLowerCase()
+    .split(/[^a-z0-9+#.-]+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 2 && !STOP_WORDS.has(part));
+
+  for (const token of rawParts) {
+    tokens.add(token);
+    const synonyms = ROLE_SYNONYMS[token];
+    if (synonyms) {
+      for (const synonym of synonyms) tokens.add(synonym);
+    }
+  }
+
+  return Array.from(tokens);
+}
+
+function summarizeText(text, maxLength = 150) {
+  if (typeof text !== "string") return "";
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (clean.length <= maxLength) return clean;
+  return `${clean.slice(0, maxLength).trimEnd()}...`;
+}
+
+const latestQuerySchema = z.object({
+  headline: z.string().trim().max(120).optional(),
+  skills: z.string().trim().max(300).optional(),
+});
+
+// Latest 6 open jobs for the landing page, prioritized for seekers with a headline
+async function getLatestPublicJobs(req, res) {
+  const parsed = latestQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid query" });
+  }
+
+  const headline = parsed.data.headline ?? "";
+  const skills = (parsed.data.skills ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const filter = {
+    status: "published",
+    createdAt: { $type: "date" },
+    deadline: { $gte: startOfTodayUtc() },
+  };
+
+  const docs = await jobs
+    .find(filter, {
+      projection: {
+        title: 1,
+        companyName: 1,
+        category: 1,
+        jobType: 1,
+        isRemote: 1,
+        location: 1,
+        deadline: 1,
+        salaryMin: 1,
+        salaryMax: 1,
+        salaryFrequency: 1,
+        responsibilities: 1,
+        requirements: 1,
+        createdAt: 1,
+      },
+    })
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(60)
+    .toArray();
+
+  const toLandingJob = (doc) => ({
+    ...toPublicJob(doc),
+    summary: summarizeText(doc.responsibilities),
+  });
+
+  const allLatest = docs.map(toLandingJob);
+  const keywords = headline ? buildMatchKeywords(headline, skills) : [];
+
+  if (keywords.length > 0) {
+    const matched = [];
+    for (let i = 0; i < docs.length; i++) {
+      const doc = docs[i];
+      const haystack = [
+        doc.title,
+        doc.category,
+        doc.requirements,
+        doc.responsibilities,
+      ]
+        .filter((v) => typeof v === "string")
+        .join(" ")
+        .toLowerCase();
+
+      if (keywords.some((kw) => haystack.includes(kw))) {
+        matched.push(allLatest[i]);
+      }
+    }
+
+    if (matched.length > 0) {
+      const selected = matched.slice(0, 6);
+      const selectedIds = new Set(selected.map((job) => job.id));
+      for (const job of allLatest) {
+        if (selected.length >= 6) break;
+        if (!selectedIds.has(job.id)) {
+          selected.push(job);
+          selectedIds.add(job.id);
+        }
+      }
+
+      return res.json({
+        jobs: selected,
+        personalized: true,
+        matchedCount: matched.length,
+      });
+    }
+  }
+
+  return res.json({
+    jobs: allLatest.slice(0, 6),
+    personalized: false,
+    matchedCount: 0,
+  });
+}
+
 publicJobsRouter.get("/", listPublicJobs);
+publicJobsRouter.get("/latest", getLatestPublicJobs);
 publicJobsRouter.get("/:id", getPublicJob);
 
 export { publicJobsRouter };
