@@ -1,6 +1,14 @@
 import { Router } from "express";
 
-import { applications, isObjectId, jobs, savedJobs, toObjectId } from "../db.js";
+import {
+  applications,
+  isObjectId,
+  jobs,
+  savedJobs,
+  toObjectId,
+  users,
+} from "../db.js";
+import { hasCompleteCompanyProfile } from "../account/account.routes.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 import { requireRole } from "../middleware/requireRole.js";
 import {
@@ -186,6 +194,19 @@ async function deleteJob(req, res) {
 
 // Insert only the validated fields; server sets identity, status and timestamps
 async function createJob(req, res) {
+  // Recruiters must complete required company information before posting jobs
+  const recruiterDoc = await users.findOne(
+    { _id: ownRecruiterId(req) },
+    { projection: { company: 1 } }
+  );
+  if (!hasCompleteCompanyProfile(recruiterDoc)) {
+    return res.status(403).json({
+      error: "Company profile required",
+      message:
+        "Please complete your required company information in Settings before posting a job.",
+    });
+  }
+
   // Enforce monthly job posting limit for Free tier recruiters (Pro has unlimited)
   const usageCheck = checkUsageLimit(req.user, "jobPosts");
   if (!usageCheck.allowed) {

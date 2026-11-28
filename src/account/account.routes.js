@@ -111,6 +111,33 @@ const professionalProfileSchema = z
   })
   .strict();
 
+const companyProfileSchema = z
+  .object({
+    name: z.string().trim().min(2, "Company name is required").max(120),
+    logo: optionalUrlSchema.default(""),
+    industry: z.string().trim().min(1, "Industry is required").max(80),
+    size: z.string().trim().min(1, "Company size is required").max(40),
+    location: z.string().trim().min(2, "Company location is required").max(120),
+    website: optionalUrlSchema.default(""),
+    description: z.string().trim().max(2000).default(""),
+  })
+  .strict();
+
+export function hasCompleteCompanyProfile(userDoc) {
+  const company = userDoc?.company;
+  if (!company) return false;
+  return Boolean(
+    typeof company.name === "string" &&
+      company.name.trim().length >= 2 &&
+      typeof company.industry === "string" &&
+      company.industry.trim().length >= 1 &&
+      typeof company.size === "string" &&
+      company.size.trim().length >= 1 &&
+      typeof company.location === "string" &&
+      company.location.trim().length >= 2
+  );
+}
+
 // JSON bodies must be application/json
 function requireJsonContentType(req, res, next) {
   const contentType = req.headers["content-type"] || "";
@@ -168,6 +195,7 @@ async function getProfile(req, res) {
         city: 1,
         country: 1,
         profile: 1,
+        company: 1,
       },
     }
   );
@@ -177,6 +205,7 @@ async function getProfile(req, res) {
   }
 
   const prof = userDoc.profile || {};
+  const comp = userDoc.company || {};
   res.json({
     profile: {
       name: userDoc.name || "",
@@ -197,6 +226,15 @@ async function getProfile(req, res) {
         linkedinUrl: prof.links?.linkedinUrl || "",
         githubUrl: prof.links?.githubUrl || "",
         otherUrl: prof.links?.otherUrl || "",
+      },
+      company: {
+        name: comp.name || "",
+        logo: comp.logo || "",
+        industry: comp.industry || "",
+        size: comp.size || "",
+        location: comp.location || "",
+        website: comp.website || "",
+        description: comp.description || "",
       },
     },
   });
@@ -254,6 +292,34 @@ async function updateProfessionalProfile(req, res) {
   });
 }
 
+// Update authenticated recruiter's company profile
+async function updateCompanyProfile(req, res) {
+  if (req.user.role !== "recruiter") {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const parsed = companyProfileSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const message =
+      parsed.error.issues[0]?.message || "Invalid company details";
+    return res.status(400).json({ error: message });
+  }
+
+  await users.updateOne(
+    { _id: toObjectId(req.user.id) },
+    {
+      $set: {
+        company: parsed.data,
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  res.json({
+    company: parsed.data,
+  });
+}
+
 accountRouter.put("/role", accountLimiter, requireJsonContentType, changeRole);
 accountRouter.get("/profile", getProfile);
 accountRouter.put(
@@ -267,6 +333,12 @@ accountRouter.put(
   profileMutationLimiter,
   requireJsonContentType,
   updateProfessionalProfile
+);
+accountRouter.put(
+  "/profile/company",
+  profileMutationLimiter,
+  requireJsonContentType,
+  updateCompanyProfile
 );
 
 export { accountRouter };
